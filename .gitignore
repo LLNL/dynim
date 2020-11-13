@@ -1,0 +1,12 @@
+*DS_Store
+.idea
+*/__pycache__/
+*.pyc
+*.idx
+*.csv
+*.chk
+
+build/
+dynim.egg-info/
+examples/test_workspace/
+examples/expt_data/
