@@ -214,7 +214,8 @@ class HDSpace(object):
                 # knn.append((np.array([-1]), np.array([np.nan])))
             else:
                 vi = vi[k0:]
-                knn.append((inds[i][vi], dists[i][vi]))
+                # faiss returns squared distance
+                knn.append((inds[i][vi], np.sqrt(dists[i][vi])))
 
         # the return value is a list of n tuples (n = number of query points)
         # each tuple contains (id, dist)
