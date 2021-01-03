@@ -15,10 +15,13 @@ from .sampler import Sampler
 class SamplerRandom(Sampler):
 
     # --------------------------------------------------------------------------
-    def __init__(self, name: str, workspace: str, buffer_size: int):
+    def __init__(self, name: str, workspace: str,
+                 min_cands_b4_sel: int = 0, buffer_size: int = 0):
 
         self.type = 'SamplerRandom'
-        super(SamplerRandom, self).__init__(name, workspace, buffer_size)
+        super().__init__(name, workspace,
+                         min_cands_b4_sel = min_cands_b4_sel,
+                         buffer_size = buffer_size)
 
     # --------------------------------------------------------------------------
     # confirm the selection of these points

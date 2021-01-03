@@ -23,7 +23,8 @@ class TestDynim(unittest.TestCase):
         super(TestDynim, self).__init__(*args, **kwargs)
 
     def test_sampler_random(self):
-        sampler = dynim.SamplerRandom('test_id', self.workspace, 100)
+        sampler = dynim.SamplerRandom('test_id', self.workspace,
+                                      min_cands_b4_sel=0, buffer_size=100)
         sampler.add_candidates(self.samples)
         self.assertTrue(len(sampler.select(5)) == 5)
 
@@ -33,7 +34,9 @@ class TestDynim(unittest.TestCase):
         hdspace.setup(2)
         hdspace.train(training_samples)
 
-        sampler = dynim.SamplerImportance('test_id', self.workspace, 100, 10)
+        sampler = dynim.SamplerImportance('test_id', self.workspace,
+                                          min_cands_b4_sel=0, buffer_size=100,
+                                          min_rand_b4_importance=10)
         sampler.set_hdspace(hdspace)
         sampler.add_candidates(self.samples)
         self.assertTrue(len(sampler.select(5)) == 5)

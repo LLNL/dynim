@@ -66,8 +66,9 @@ def draw_dynimexact_samples(x, niters, ksamples):
     h.setup(dim=x.shape[1], idx_type='exact')
 
     sampler = dynim.SamplerImportance('dynim', 'test_workspace',
-                                      buffer_size=x.shape[0] + 1,
-                                      n_minsamples=ksamples)
+                                      buffer_size = x.shape[0] + 1,
+                                      min_cands_b4_sel = 0,
+                                      min_rand_b4_importance = ksamples)
     sampler.set_hdspace(h)
 
     # convert the data to dynim hdpoints
@@ -83,7 +84,8 @@ def draw_dynimexact_samples(x, niters, ksamples):
         xidx = [_.id for _ in selected]         # we need only the ids
 
         sampled.append(np.array(x[xidx]))
-        weights.append(sampler.get_weights())
+        weights.append(sampler.get_weights()[1])
+
     elapsed = timeit.default_timer() - start_time
     print('took {:.04f} s'.format(elapsed))
 

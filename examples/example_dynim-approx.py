@@ -10,6 +10,7 @@
 import logging
 LOGGER = logging.getLogger()
 
+import numpy as np
 import dynim
 from utils import create_data
 
@@ -48,7 +49,7 @@ if __name__ == '__main__':
     # https://github.com/facebookresearch/faiss/wiki/Faiss-indexes
     # https://github.com/facebookresearch/faiss/wiki/Faster-search
     h1 = dynim.HDSpace()
-    h1.setup(dim=dim, idx_type='approx', nlist=100, nprobes=10)
+    h1.setup(dim=dim, idx_type='approx', nlist=100, nprobes=50)
     h1.train(x1)
     h1.checkpoint("./hdspace.idx")
     del h1
@@ -68,11 +69,13 @@ if __name__ == '__main__':
     # --------------------------------------------------------------------------
     # finally, let's make some queries to this hdspace
 
-    # let's find the nearest neighbors for the remaining set if points
+    # let's find the nearest neighbors for the remaining set of points
     # the functions returns [k0, k+k0] nearest neighbors
-    # use k0=0 if query point (x3) have not been "added" to the hdspace
-    # otherwise, use k0=1 to ignore the nearest neighbor
+    # use k0=0 if query points (x3) have not been "added" to the hdspace
+    # otherwise, use k0=1 to ignore the nearest neighbor (i.e., self)
     nn = h2.get_knn(x3, k=2, k0=1)
+
+    # a shortcut exists if only the mean distance to knn is needed!
     ndist = h2.get_knn_distance(x3, k=2, k0=1)
 
     # the return value is a list of n tuples (n = number of query points)
@@ -82,6 +85,13 @@ if __name__ == '__main__':
     # size may be smaller in case the system could not find k neighbors
     # either due to not having enough points or approximation error
     for i in range(x3.shape[0]):
-        print('knn of {} are: ids = {}, dists = {}; mean_dist = {}'.format(x3[i], nn[i][0], nn[i][1], ndist[i]))
+        _nids = nn[i][0]
+        _ndists = nn[i][1]
+
+        print('knn of {} are: ids = {}, dists = {}; mean_dist = {}'
+              .format(x3[i], _nids, _ndists, ndist[i]))
+
+        if len(_ndists) > 0:
+            assert np.isclose(_ndists.mean(), ndist[i])
 
 # ------------------------------------------------------------------------------

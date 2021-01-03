@@ -7,14 +7,13 @@
 
 import os
 import sys
-import time
 import yaml
 from typing import List, Union
 import logging
 
 import numpy as np
 from .hdpoint import HDPoint
-from .utils import format_time, take_backup, write_history
+from .utils import format_time, backup_fname, take_backup, write_history
 
 LOGGER = logging.getLogger(__name__)
 
@@ -25,35 +24,36 @@ LOGGER = logging.getLogger(__name__)
 class Sampler(object):
 
     # --------------------------------------------------------------------------
-    def __init__(self, name: str, workspace: str, buffer_size: int):
+    def __init__(self, name: str, workspace: str,
+                 min_cands_b4_sel: int = 0, buffer_size: int = 0):
 
         """ Initialize a Sampler.
         Args:
             workspace (str):    a workspace directory where
                                 history and checkpoints will be written
             buffer_size (int):  size of the candidate buffer_size
+            min_cands_b4_sel (int):  min number of samples before any selection
         """
         assert isinstance(name, str)
         assert isinstance(workspace, str)
-        assert isinstance(buffer_size, int) and int(buffer_size >= 0)
+        assert isinstance(buffer_size, int) and int(buffer_size) >= 0
+        assert isinstance(min_cands_b4_sel, int) and int(min_cands_b4_sel) >= 0
 
         self.name = name
         self.workspace = workspace
         self.buffer_size = buffer_size
+        self.min_cands_b4_sel = min_cands_b4_sel
 
         if not os.path.isdir(self.workspace):
             os.makedirs(self.workspace)
 
         # prepare to write the history and checkpoints
-        self.tag = '{}_{}'.format(self.name, self.type)
+        self.tag = '{}-{}'.format(self.type, self.name)
         self.chkpts = {
             'state': os.path.join(self.workspace, '{}.state.chk'.format(self.tag)),
             'data':  os.path.join(self.workspace, '{}.data.npz'.format(self.tag))
         }
-        self.hists = {
-            'selections': os.path.join(self.workspace, '{}.selections.csv'.format(self.tag)),
-            'discards':  os.path.join(self.workspace, '{}.discards.csv'.format(self.tag))
-        }
+        self.hists = os.path.join(self.workspace, '{}.history.csv'.format(self.tag))
 
         # candidates for the next set of selection (sorted list of samples)
         self.candidates = np.array([])
@@ -79,11 +79,37 @@ class Sampler(object):
         return self.__str__()
 
     # --------------------------------------------------------------------------
+    def _state_dict(self):
+        return {'ncached': len(self.cached),
+                'ncandidates': len(self.candidates),
+                'nselected': len(self.selected),
+                'ndiscarded': len(self.discarded)}
+
     def num_candidates(self):
         return len(self.cached) + len(self.candidates)
 
     def num_selected(self):
         return len(self.selected)
+
+    @staticmethod
+    def _filter(data_to_filter, filter_if_present_in_list):
+
+        if len(data_to_filter) == 0 or len(filter_if_present_in_list) == 0:
+            return data_to_filter, []
+
+        # since filter_if_present_in_list is likely very large,
+        # let's use numpy to find the ones that are already included
+        ids_in_data = np.array([_.id for _ in data_to_filter])
+        ids_in_list = np.array([_.id for _ in filter_if_present_in_list])
+        is_present = np.intersect1d(ids_in_data, ids_in_list)
+
+        # no intersection
+        if is_present.shape[0] == 0:
+            return data_to_filter, []
+
+        # slower list comprehension to find the ones not present
+        is_not_present = [_ for _ in data_to_filter if _.id not in is_present]
+        return is_not_present, is_present.tolist()
 
     # --------------------------------------------------------------------------
     # add new candidates to the sampler
@@ -98,8 +124,40 @@ class Sampler(object):
             return
 
         LOGGER.debug('Adding {} candidates to ({})'.format(n, self.__str__()))
+
+        # remove the ones we have already seen
+        points, discarded = self._filter(points, self.selected)
+        if len(discarded) > 0:
+            LOGGER.warning('Rejecting {} already selected points: {}'
+                           .format(len(discarded), discarded))
+            write_history(self.hists, 'rejected:add_cands:already_selected',
+                          discarded, self._state_dict())
+
+        points, discarded = self._filter(points, self.discarded)
+        if len(discarded) > 0:
+            LOGGER.warning('Rejecting {} already discarded points: {}'
+                           .format(len(discarded), discarded))
+            write_history(self.hists, 'rejected:add_cands:already_discarded',
+                          discarded, self._state_dict())
+
+        points, discarded = self._filter(points, self.cached)
+        if len(discarded) > 0:
+            LOGGER.warning('Rejecting {} already cached points: {}'
+                            .format(len(discarded), discarded))
+            write_history(self.hists, 'rejected:add_cands:already_cached',
+                          discarded, self._state_dict())
+
+        points, discarded = self._filter(points, self.candidates)
+        if len(discarded) > 0:
+            LOGGER.warning('Rejecting {} already candidates points: {}'
+                           .format(len(discarded), discarded))
+            write_history(self.hists, 'rejected:add_cands:already_candidates',
+                          discarded, self._state_dict())
+
+        # finally, add the ones we have not seen before
         self.cached.extend(points)
         LOGGER.info('Added {} candidates to ({})'.format(n, self.__str__()))
+        write_history(self.hists, 'added', points, self._state_dict())
 
     # --------------------------------------------------------------------------
     # update the state of the sampler
@@ -128,9 +186,8 @@ class Sampler(object):
                 self.candidates = self.candidates[:self.buffer_size]
                 self.discarded.extend(discard)
 
-                # write selections and discards
-                ts = time.time()
-                write_history(self.hists['discards'], discard, ts)
+                # write discards
+                write_history(self.hists, 'discarded', discard, self._state_dict())
 
         LOGGER.debug('Updated sampler ({})'.format(self.__str__()))
 
@@ -144,16 +201,16 @@ class Sampler(object):
         if k == 0:
             return []
 
-        self.update()
-
-        n = len(self.candidates)
-        if n == 0:
+        if 0 < self.min_cands_b4_sel and self.num_candidates() < self.min_cands_b4_sel:
+            LOGGER.debug('Not selecting due to too few candidates: {}'
+                         .format(self.__str__()))
             return []
 
+        self.update()
         LOGGER.debug('Selecting {} samples from ({})'.format(k, self.__str__()))
 
         # pick the top k candidates
-        k = min(k, n)
+        k = min(k, len(self.candidates))
         selection = list(self.candidates[:k])
 
         LOGGER.info('Selected {} samples from ({})'.format(k, self.__str__()))
@@ -243,16 +300,15 @@ class Sampler(object):
         # and add to the selected list
         self.selected.extend(selection)
 
-        # write selections and discards
-        ts = time.time()
-        write_history(self.hists['selections'], selection, ts)
+        # write selections
+        write_history(self.hists, 'selected', selection, self._state_dict())
 
     # --------------------------------------------------------------------------
     # checkpoint and restore
     # --------------------------------------------------------------------------
     def checkpoint(self):
 
-        st = format_time(time.time())
+        st = format_time()
         LOGGER.info('Checkpointing {} at {}'.format(self.__str__(), st))
         sys.stdout.flush()
 
@@ -271,9 +327,10 @@ class Sampler(object):
             yaml.dump(state, outfile)
 
         # save data as npz
-        np.savez(self.chkpts['data'], t=st, type=self.type, name=self.name,
-                 cached=self.cached, candidates=self.candidates,
-                 selected=self.selected, discarded=self.discarded)
+        np.savez_compressed(self.chkpts['data'],
+                            t=st, type=self.type, name=self.name,
+                            cached=self.cached, candidates=self.candidates,
+                            selected=self.selected, discarded=self.discarded)
 
         LOGGER.debug('Checkpointing done for Sampler')
 
@@ -283,7 +340,7 @@ class Sampler(object):
             if not os.path.isfile(self.chkpts[k]):
                 LOGGER.debug('Checkpoint file {} does not exist!'
                              .format(self.chkpts[k]))
-                return
+                return False
 
         # load yaml
         with open(self.chkpts['state'], 'r') as infile:
@@ -299,7 +356,7 @@ class Sampler(object):
             assert self.name == data['name']
 
         except Exception as e:
-            LOGGER.error('Failed to restore. Error = {}'.format(e))
+            LOGGER.error('Failed to restore {}. Error = {}'.format(self.chkpts['data'], e))
             raise e
 
         self.cached = list(data['cached'])
