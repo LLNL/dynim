@@ -35,7 +35,7 @@ def draw_random_samples(x, niters, ksamples):
     weights = []
     xi = np.arange(x.shape[0])
     for i in range(niters):
-        xidx = xi[np.random.randint(0, xi.shape, size=ksamples)]
+        xidx = np.random.choice(xi, size=ksamples, replace=False)
 
         sampled.append(np.array(x[xidx]))
         nsampled += len(xidx)
@@ -44,7 +44,7 @@ def draw_random_samples(x, niters, ksamples):
         weights.append(w*np.ones(nsampled, dtype=np.float32))
 
         # delete these points from the list
-        xi = np.delete(xi, xidx)
+        xi = np.setdiff1d(xi, xidx)
 
     elapsed = timeit.default_timer() - start_time
     print('took {:.04f} s'.format(elapsed))
