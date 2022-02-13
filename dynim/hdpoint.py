@@ -14,6 +14,8 @@ import numpy as np
 class HDPoint:
     """A high-dimensional point."""
 
+    fetch_ids = np.vectorize(lambda d: d.id, otypes=[str])
+
     def __init__(self, id: (int, str),
                  coords: np.ndarray,
                  rank:   np.float32 = np.float32('nan')) -> None:

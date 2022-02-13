@@ -5,6 +5,7 @@
 
 ################################################################################
 
+import os
 from typing import List
 import logging
 
@@ -34,7 +35,7 @@ class HDSpace(object):
         else:
             assert False
 
-        return 'HDSpace <D={}, type={}, npoints={}>'.format(self.dim, _type, self.count())
+        return f'HDSpace <D={self.dim}, type={_type}, npoints={self.count()}>'
 
     def __repr__(self) -> str:
         return self.__str__()
@@ -55,8 +56,7 @@ class HDSpace(object):
         if len(points.shape) != 2:
             raise ValueError('Need points as a 2-rank vector of size (n,dim)')
         if points.shape[1] != self.dim:
-            raise ValueError('Dimensionality mismatch: {} != (,{})'
-                             .format(points.shape, self.dim))
+            raise ValueError(f'Dimensionality mismatch: {points.shape} != (,{self.dim})')
 
     def _assert_valid_index(self) -> None:
         assert self.index is not None
@@ -79,17 +79,15 @@ class HDSpace(object):
         if idx_type == 'exact':
             # quantizer is used as the index
             self.index = quantizer
-            LOGGER.info('Initialized {}-D Space with {} metric'
-                        .format(self.dim, idx_type))
+            LOGGER.info(f'Initialized {self.dim}-D Space with {idx_type} metric')
             return
 
         # else
         # quantizer is used for mapping points to centers of voronoi cells
-        self.index = faiss.IndexIVFFlat(quantizer, self.dim, nlist,
-                                        faiss.METRIC_L2)
+        self.index = faiss.IndexIVFFlat(quantizer, self.dim, nlist, faiss.METRIC_L2)
         self.index.nprobe = nprobes
-        LOGGER.info('Initialized {}-D Space with {} metric ({}, {})'
-                    .format(self.dim, idx_type, nlist, nprobes))
+        LOGGER.info(f'Initialized {self.dim}-D Space with {idx_type} metric '
+                    f'({nlist}, {nprobes})')
 
     # --------------------------------------------------------------------------
     # train the data-structure using some data
@@ -102,13 +100,11 @@ class HDSpace(object):
         assert not self.index.is_trained
         self._assert_valid_points(points)
 
-        LOGGER.debug('Training with {} points'.format(points.shape))
+        LOGGER.debug(f'Training with {points.shape} points')
         try:
             self.index.train(points)
-
         except Exception as e:
-            LOGGER.error('Failed to train {}-D Space. Error = {}'
-                         .format(self.dim, e))
+            LOGGER.error(f'Failed to train {self.dim}-D Space. Error = {e}')
 
         assert self.index.is_trained
 
@@ -117,16 +113,20 @@ class HDSpace(object):
     # --------------------------------------------------------------------------
     def restore(self, fname: str) -> bool:
 
+        if not os.path.isfile(fname):
+            LOGGER.warning(f'Failed to find ({fname})!')
+            return False
+
         try:
             self.index = faiss.read_index(fname)
 
         except Exception as e:
-            LOGGER.error('Failed to restore HD Space. Error = {}'.format(e))
+            LOGGER.error(f'Failed to restore HD Space. Error = {e}')
             return False
 
         self.dim = self.index.d
-        LOGGER.info('Successfully restored {}-D Space with {} points from ({})'
-                    .format(self.dim, self.count(), fname))
+        LOGGER.info(f'Successfully restored {self.dim}-D Space '
+                    f'with {self.count()} points from ({fname})')
         return True
 
     # checkpoint the latent space
@@ -136,12 +136,12 @@ class HDSpace(object):
             faiss.write_index(self.index, fname)
 
         except Exception as e:
-            LOGGER.error('Failed to checkpoint {}-D Space. Error = {}'
-                         .format(self.dim, e))
+            LOGGER.error(f'Failed to checkpoint {self.dim}-D Space. '
+                         f'Error = {e}')
             return False
 
-        LOGGER.info('Successfully checkpointed {}-D Space with {} points to ({})'
-                    .format(self.dim, self.count(), fname))
+        LOGGER.info(f'Successfully checkpointed {self.dim}-D Space '
+                    f'with {self.count()} points to ({fname})')
         return True
 
     # --------------------------------------------------------------------------
@@ -152,14 +152,12 @@ class HDSpace(object):
         self._assert_valid_index()
         self._assert_valid_points(points)
 
-        LOGGER.debug('Adding {} points to {}-D Space'
-                     .format(points.shape[0], self.dim))
+        LOGGER.debug(f'Adding {points.shape} points to {self.dim}-D Space')
         try:
             self.index.add(points)
 
         except Exception as e:
-            LOGGER.error('Failed to add point to {}-D Space (error = {})'
-                         .format(self.dim, e))
+            LOGGER.error(f'Failed to add point to {self.dim}-D Space (error = {e})')
             return False
 
         return True
@@ -178,44 +176,50 @@ class HDSpace(object):
 
         # dont make the query if the all the points will be excluded later
         if k0 >= n or n == 0:
-            LOGGER.warning('Invalid request (k0={} > total={})'.format(k0, n))
+            LOGGER.warning(f'Invalid request (k0={k0} > total={n})')
             return []
 
         # ----------------------------------------------------------------------
         self._assert_valid_points(points)
 
         nquery = points.shape[0]
-        LOGGER.debug('Getting ([{}, {}))-nn for {} query points (total = {})'
-                     .format(k0, k + k0, nquery, n))
+        LOGGER.debug(f'Getting ([{k0}, {k+k0}))-nn for {nquery} query points (total = {n})')
+
+        k = min(k0 + k, n)
+
+        # ----------------------------------------------------------------------
         try:
-            k = min(k0 + k, n)
-            dists, inds = self.index.search(points, k)
+            chunk_size = 10000
+
+            res = [self.index.search(points[chunk_start:chunk_start + chunk_size], k)
+                   for chunk_start in range(0, nquery, chunk_size)]
+
+            dists = np.concatenate([_[0] for _ in res])
+            inds = np.concatenate([_[1] for _ in res])
+            assert dists.shape == (nquery, k) and inds.shape == (nquery, k), 'Invalid aggregation of knn'
 
         except Exception as e:
-            LOGGER.error('Failed to get knn from {}-D Space (error = {})'
-                         .format(self.dim, e))
+            LOGGER.error(f'Failed to get knn from {self.dim}-D Space (error = {e})')
             return []
-
-        assert dists.shape == (nquery, k) and inds.shape == (nquery, k)
 
         # ----------------------------------------------------------------------
         # remove any invalid values
         # although, should not be needed since we adjusted k to be <= n
         valids = np.bitwise_and(inds != -1, dists != np.finfo(dists.dtype).max)
 
-        # pick valid knn after ignoring the first k0 valid points
-        knn = []
-        for i in range(nquery):
+        def _ignore_k0(i):
             vi = np.where(valids[i])[0]
 
             # check to see if we didn't find anything valid
             if vi.shape[0] == 0:
-                knn.append((np.array([]), np.array([])))
-                # knn.append((np.array([-1]), np.array([np.nan])))
+                return np.array([]), np.array([])
             else:
                 vi = vi[k0:]
                 # faiss returns squared distance
-                knn.append((inds[i][vi], np.sqrt(dists[i][vi])))
+                return inds[i][vi], np.sqrt(dists[i][vi])
+
+        # pick valid knn after ignoring the first k0 valid points
+        knn = [_ignore_k0(i) for i in range(nquery)]
 
         # the return value is a list of n tuples (n = number of query points)
         # each tuple contains (id, dist)
@@ -233,8 +237,7 @@ class HDSpace(object):
         self._assert_valid_points(points)
         nquery = points.shape[0]
 
-        LOGGER.debug('Getting ([{}, {}))-nn dist for {} points (total = {})'
-                     .format(k0, k + k0, nquery, self.count()))
+        LOGGER.debug(f'Getting ([{k0}, {k0+k}))-nn dist for {nquery} points (total = {self.count()})')
 
         knn = self.get_knn(points, k, k0)
         mean_dists = -1. * np.ones(nquery).astype(np.float32)
