@@ -6,14 +6,12 @@
 ################################################################################
 
 import os
-import sys
-import yaml
 from typing import List, Union
 import logging
 
 import numpy as np
 from .hdpoint import HDPoint
-from .utils import format_time, backup_fname, take_backup, write_history
+from .utils import format_time, take_backup, filter_list, write_history
 
 LOGGER = logging.getLogger(__name__)
 
@@ -25,7 +23,8 @@ class Sampler(object):
 
     # --------------------------------------------------------------------------
     def __init__(self, name: str, workspace: str,
-                 min_cands_b4_sel: int = 0, buffer_size: int = 0):
+                 buffer_size: int = 0,
+                 min_cands_b4_sel: int = 0):
 
         """ Initialize a Sampler.
         Args:
@@ -43,17 +42,7 @@ class Sampler(object):
         self.workspace = workspace
         self.buffer_size = buffer_size
         self.min_cands_b4_sel = min_cands_b4_sel
-
-        if not os.path.isdir(self.workspace):
-            os.makedirs(self.workspace)
-
-        # prepare to write the history and checkpoints
-        self.tag = '{}-{}'.format(self.type, self.name)
-        self.chkpts = {
-            'state': os.path.join(self.workspace, '{}.state.chk'.format(self.tag)),
-            'data':  os.path.join(self.workspace, '{}.data.npz'.format(self.tag))
-        }
-        self.hists = os.path.join(self.workspace, '{}.history.csv'.format(self.tag))
+        os.makedirs(self.workspace, exist_ok=True)
 
         # candidates for the next set of selection (sorted list of samples)
         self.candidates = np.array([])
@@ -67,96 +56,112 @@ class Sampler(object):
         # samples that have been dropped (maintain for recalculation of weights)
         self.discarded = []
 
+        # function to explicitly scale the rank
+        self.rank_scaler = None
+
+        # prepare to write the history and checkpoints
+        self.schkpt = os.path.join(self.workspace, f'{self.__tag__()}.data.npz')
+        self.hists = os.path.join(self.workspace, f'{self.__tag__()}.history.csv')
+
     # --------------------------------------------------------------------------
+    def __type__(self):
+        return type(self).__name__
+
+    def __tag__(self):
+        return f'{self.__type__()}-{self.name}'
+
     def __str__(self):
-        s = '{}<{}> '.format(self.type, self.name)
-        s += '[{} cached, {} candidates, {} selected, {} discarded]'\
-            .format(len(self.cached), len(self.candidates),
-                    len(self.selected), len(self.discarded))
-        return s
+        return f'[{self.__type__()}<{self.name}>:' \
+               f' {len(self.cached)} cached,' \
+               f' {len(self.candidates)} candidates,' \
+               f' {len(self.selected)} selected,' \
+               f' {len(self.discarded)} discarded]'
 
     def __repr__(self):
         return self.__str__()
 
-    # --------------------------------------------------------------------------
     def _state_dict(self):
         return {'ncached': len(self.cached),
                 'ncandidates': len(self.candidates),
                 'nselected': len(self.selected),
                 'ndiscarded': len(self.discarded)}
 
+    # --------------------------------------------------------------------------
     def num_candidates(self):
         return len(self.cached) + len(self.candidates)
 
     def num_selected(self):
         return len(self.selected)
 
-    @staticmethod
-    def _filter(data_to_filter, filter_if_present_in_list):
+    def set_rank_scaler(self, rank_scaler: callable) -> None:
+        assert callable(rank_scaler)
+        LOGGER.info(f'Setting rank scalar ({rank_scaler}) for ({self.__tag__()})')
+        self.rank_scaler = rank_scaler
 
-        if len(data_to_filter) == 0 or len(filter_if_present_in_list) == 0:
-            return data_to_filter, []
+    # --------------------------------------------------------------------------
+    def _apply_ranks_to_candidates(self, ranks):
+        assert isinstance(ranks, np.ndarray)
+        assert ranks.dtype == np.float32
+        assert ranks.shape[0] == len(self.candidates)
 
-        # since filter_if_present_in_list is likely very large,
-        # let's use numpy to find the ones that are already included
-        ids_in_data = np.array([_.id for _ in data_to_filter])
-        ids_in_list = np.array([_.id for _ in filter_if_present_in_list])
-        is_present = np.intersect1d(ids_in_data, ids_in_list)
+        if self.rank_scaler is None:
+            LOGGER.info(f'Applying {len(self.candidates)} ranks to candidates')
+            for i, sample in enumerate(self.candidates):
+                sample.rank = ranks[i]
 
-        # no intersection
-        if is_present.shape[0] == 0:
-            return data_to_filter, []
-
-        # slower list comprehension to find the ones not present
-        is_not_present = [_ for _ in data_to_filter if _.id not in is_present]
-        return is_not_present, is_present.tolist()
+        else:
+            LOGGER.info(f'Scaling {len(self.candidates)} ranks using ({self.rank_scaler})')
+            for i, sample in enumerate(self.candidates):
+                sample.rank = np.float32(self.rank_scaler(sample.id, ranks[i]))
 
     # --------------------------------------------------------------------------
     # add new candidates to the sampler
     # --------------------------------------------------------------------------
-    def add_candidates(self, points: List[HDPoint]) -> None:
+    def add_candidates(self, points: List[HDPoint], do_filter=True) -> None:
 
-        assert isinstance(points, list)
+        assert isinstance(points, (list, np.ndarray))
         assert all([isinstance(p, HDPoint) for p in points])
 
         n = len(points)
         if n == 0:
             return
 
-        LOGGER.debug('Adding {} candidates to ({})'.format(n, self.__str__()))
+        # ----------------------------------------------------------------------
+        def _filter(_ids_to_filter, _ids_to_check_against, _tag):
 
-        # remove the ones we have already seen
-        points, discarded = self._filter(points, self.selected)
-        if len(discarded) > 0:
-            LOGGER.warning('Rejecting {} already selected points: {}'
-                           .format(len(discarded), discarded))
-            write_history(self.hists, 'rejected:add_cands:already_selected',
-                          discarded, self._state_dict())
+            if len(_ids_to_check_against) == 0:
+                return np.zeros(len(_ids_to_filter), dtype=bool)
 
-        points, discarded = self._filter(points, self.discarded)
-        if len(discarded) > 0:
-            LOGGER.warning('Rejecting {} already discarded points: {}'
-                           .format(len(discarded), discarded))
-            write_history(self.hists, 'rejected:add_cands:already_discarded',
-                          discarded, self._state_dict())
+            dup_flags = np.isin(_ids_to_filter, _ids_to_check_against, assume_unique=True)
+            ndups = dup_flags.sum()
+            if ndups > 0:
+                dups = _ids_to_filter[dup_flags]
+                LOGGER.warning(f'Rejecting {ndups} already {_tag} points: {dups}')
+                write_history(self.hists, f'rejected:add_cands:already_{_tag}',
+                              dups, self._state_dict())
 
-        points, discarded = self._filter(points, self.cached)
-        if len(discarded) > 0:
-            LOGGER.warning('Rejecting {} already cached points: {}'
-                            .format(len(discarded), discarded))
-            write_history(self.hists, 'rejected:add_cands:already_cached',
-                          discarded, self._state_dict())
+            return dup_flags
 
-        points, discarded = self._filter(points, self.candidates)
-        if len(discarded) > 0:
-            LOGGER.warning('Rejecting {} already candidates points: {}'
-                           .format(len(discarded), discarded))
-            write_history(self.hists, 'rejected:add_cands:already_candidates',
-                          discarded, self._state_dict())
+        # ----------------------------------------------------------------------
+        LOGGER.debug(f'Adding {n} candidates to ({self})')
+
+        # filter the ids we have already seen
+        if do_filter:
+            pids = HDPoint.fetch_ids(points)
+            dflags0 = _filter(pids, HDPoint.fetch_ids(self.selected), 'selected')
+            dflags1 = _filter(pids, HDPoint.fetch_ids(self.discarded), 'discarded')
+            dflags2 = _filter(pids, HDPoint.fetch_ids(self.cached), 'cached')
+            dflags3 = _filter(pids, HDPoint.fetch_ids(self.candidates), 'candidates')
+
+            dflags = np.logical_or.reduce((dflags0, dflags1, dflags2, dflags3))
+            points = np.array(points)
+            points = points[np.logical_not(dflags)]
+            points = points.tolist()
 
         # finally, add the ones we have not seen before
+        n = len(points)
+        LOGGER.info(f'Added {n} candidates to ({self})')
         self.cached.extend(points)
-        LOGGER.info('Added {} candidates to ({})'.format(n, self.__str__()))
         write_history(self.hists, 'added', points, self._state_dict())
 
     # --------------------------------------------------------------------------
@@ -164,7 +169,7 @@ class Sampler(object):
     # --------------------------------------------------------------------------
     def update(self):
 
-        LOGGER.debug('Updating sampler ({})'.format(self.__str__()))
+        LOGGER.profile(f'Updating sampler ({self})')
 
         # move the cached candidates to actual candidate list
         self.candidates = np.append(self.candidates, self.cached)
@@ -189,7 +194,7 @@ class Sampler(object):
                 # write discards
                 write_history(self.hists, 'discarded', discard, self._state_dict())
 
-        LOGGER.debug('Updated sampler ({})'.format(self.__str__()))
+        LOGGER.profile(f'Updated sampler ({self})')
 
     # --------------------------------------------------------------------------
     # select k new candidates
@@ -201,24 +206,24 @@ class Sampler(object):
         if k == 0:
             return []
 
-        if 0 < self.min_cands_b4_sel and self.num_candidates() < self.min_cands_b4_sel:
-            LOGGER.debug('Not selecting due to too few candidates: {}'
-                         .format(self.__str__()))
+        if (self.min_cands_b4_sel > 0) and \
+           (self.num_selected() == 0) and \
+           (self.num_candidates() < self.min_cands_b4_sel):
+            LOGGER.debug(f'Not selecting due to too few candidates from {self}')
             return []
 
         self.update()
-        LOGGER.debug('Selecting {} samples from ({})'.format(k, self.__str__()))
+        LOGGER.debug(f'Selecting {k} samples from {self}')
 
         # pick the top k candidates
         k = min(k, len(self.candidates))
         selection = list(self.candidates[:k])
 
-        LOGGER.info('Selected {} samples from ({})'.format(k, self.__str__()))
+        LOGGER.info(f'Selected {k} samples from {self}')
 
         if confirm_selection:
             self._confirm_selections(selection)
-            LOGGER.info('Confirmed selection of {} samples from ({})'
-                        .format(k, self.__str__()))
+            LOGGER.info(f'Confirmed selection of {k} samples from {self}')
 
         return selection
 
@@ -242,42 +247,37 @@ class Sampler(object):
         if k == 0:
             return False
 
-        LOGGER.debug('Confirming selection of {} samples from ({})'
-                     .format(k, self.__str__()))
+        LOGGER.debug(f'Confirming selection of {k} samples from {self}')
 
         # ----------------------------------------------------------------------
         # make sure that the given selection are the top candidates
         if is_samples:
             for i in range(k):
                 if self.candidates[i] != selection[i]:
-                    raise AttributeError('Cannot confirm selection [{} = {}]; '
-                                         'not found in candidates.'
-                                         .format(i, selection[i]))
+                    raise AttributeError(f'Cannot confirm selection: '
+                                         f'[{i} = {selection[i]}] not a candidate')
         else:
             for i in range(k):
                 if self.candidates[i].id != selection[i]:
-                    raise AttributeError('Cannot confirm selection [{} = {}]; '
-                                         'not found in candidates.'
-                                         .format(i, selection[i]))
+                    raise AttributeError(f'Cannot confirm selection: '
+                                         f'[{i} = {selection[i]}] not a candidate')
+
         # ----------------------------------------------------------------------
         selection = list(self.candidates[:k])
 
         # now, check that these are not previously selected
         for i in range(k):
             if selection[i] in self.selected:
-                raise AttributeError('Cannot confirm selection [{} = {}]; '
-                                     'already selected.'
-                                     .format(i, selection[i]))
+                raise AttributeError(f'Cannot confirm selection: '
+                                     f'[{i} = {selection[i]}] already selected')
 
             if selection[i] in self.discarded:
-                raise AttributeError('Cannot confirm selection [{} = {}]; '
-                                     'already discarded.'
-                                     .format(i, selection[i]))
+                raise AttributeError(f'Cannot confirm selection: '
+                                     f'[{i} = {selection[i]}] already discarded')
 
         # ----------------------------------------------------------------------
         self._confirm_selections(selection)
-        LOGGER.info('Confirmed selection of {} samples from ({})'
-                    .format(k, self.__str__()))
+        LOGGER.info(f'Confirmed selection of {k} samples from {self}')
 
     # --------------------------------------------------------------------------
     def _confirm_selections(self, selection: List[HDPoint]) -> bool:
@@ -289,7 +289,7 @@ class Sampler(object):
         if k == 0:
             return False
 
-        LOGGER.debug('Confirming selection of {} samples'.format(k))
+        LOGGER.debug(f'Confirming selection of {k} samples')
 
         # mark the selections as sampled (to be implemented by the child class!)
         self._add_selections(selection)
@@ -304,68 +304,70 @@ class Sampler(object):
         write_history(self.hists, 'selected', selection, self._state_dict())
 
     # --------------------------------------------------------------------------
+    def invalidate_candidates(self, validator):
+        assert callable(validator)
+
+        def _filter_valid(_data, tag):
+            _ids = [_.id for _ in _data]
+            _flags = [_ for _ in validator(_ids)]
+            _valids = [_data[i] for i, _ in enumerate(_flags) if _]
+            _invalids = [_data[i] for i, _ in enumerate(_flags) if not _]
+
+            LOGGER.info(f'{tag} = {len(_data)}: '
+                        f'valid = {len(_valids)}, invalid = {len(_invalids)}')
+            return _valids, _invalids
+
+        LOGGER.info(f'testing for invalid candidates for {self}')
+
+        self.cached, _invalid_cached = _filter_valid(self.cached, 'cached')
+        self.candidates, _invalid_cands = _filter_valid(self.candidates, 'candidates')
+        LOGGER.info(f'after invaliding patches: {self}')
+
+        if len(_invalid_cands) > 0:
+            _hfile = self.hists
+            write_history(_hfile, 'invalidated:cached', _invalid_cached, self._state_dict())
+            write_history(_hfile, 'invalidated:candidates', _invalid_cands, self._state_dict())
+
+        return len(_invalid_cands)
+
+    # --------------------------------------------------------------------------
     # checkpoint and restore
     # --------------------------------------------------------------------------
-    def checkpoint(self):
+    def _checkpoint(self):
 
         st = format_time()
-        LOGGER.info('Checkpointing {} at {}'.format(self.__str__(), st))
-        sys.stdout.flush()
+        LOGGER.info(f'Checkpointing Sampler data {self} at {st}')
 
-        # take backup of previous checkpoints
-        take_backup(self.chkpts['state'])
-        take_backup(self.chkpts['data'])
-
-        # save current state ast yaml
-        with open(self.chkpts['state'], 'w') as outfile:
-            state = dict(t=st, type=self.type, name=self.name,
-                         ncached=len(self.cached),
-                         nselected=len(self.selected),
-                         ncandidates=len(self.candidates),
-                         ndiscarded=len(self.discarded))
-
-            yaml.dump(state, outfile)
-
-        # save data as npz
-        np.savez_compressed(self.chkpts['data'],
-                            t=st, type=self.type, name=self.name,
+        # take backup of previous checkpoint
+        take_backup(self.schkpt)
+        np.savez_compressed(self.schkpt,
+                            t=st, type=self.__type__(), name=self.name,
                             cached=self.cached, candidates=self.candidates,
                             selected=self.selected, discarded=self.discarded)
 
-        LOGGER.debug('Checkpointing done for Sampler')
+    # --------------------------------------------------------------------------
+    def _restore(self, filename=None):
 
-    def restore(self):
-
-        for k in self.chkpts.keys():
-            if not os.path.isfile(self.chkpts[k]):
-                LOGGER.debug('Checkpoint file {} does not exist!'
-                             .format(self.chkpts[k]))
-                return False
-
-        # load yaml
-        with open(self.chkpts['state'], 'r') as infile:
-            state = yaml.load(infile, Loader=yaml.Loader)
-
-        # restore data!
-        LOGGER.debug('Restoring data from {}'.format(state['t']))
-        sys.stdout.flush()
+        if filename is None:
+            filename = self.schkpt
 
         try:
-            data = np.load(self.chkpts['data'], allow_pickle=True)
-            assert self.type == data['type']
+            LOGGER.debug(f'Restoring from ({filename})')
+            data = np.load(filename, allow_pickle=True)
+
             assert self.name == data['name']
+            assert self.__type__() == data['type']
+
+            self.cached = list(data['cached'])
+            self.selected = list(data['selected'])
+            self.candidates = np.array(data['candidates'])
+            self.discarded = list(data['discarded'])
+            data.close()
 
         except Exception as e:
-            LOGGER.error('Failed to restore {}. Error = {}'.format(self.chkpts['data'], e))
-            raise e
+            raise Exception(f'{type(e).__name__}: {e} ({filename})')
 
-        self.cached = list(data['cached'])
-        self.selected = list(data['selected'])
-        self.candidates = np.array(data['candidates'])
-        self.discarded = list(data['discarded'])
-
-        assert self.test()
-        LOGGER.info('Restored {}'.format(self.__str__()))
+        LOGGER.info(f'Successfully restored {self}')
         return True
 
 # ------------------------------------------------------------------------------

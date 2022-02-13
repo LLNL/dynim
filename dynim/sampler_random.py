@@ -6,7 +6,10 @@
 ################################################################################
 
 import numpy as np
+import logging
 from .sampler import Sampler
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------------------
@@ -16,12 +19,13 @@ class SamplerRandom(Sampler):
 
     # --------------------------------------------------------------------------
     def __init__(self, name: str, workspace: str,
-                 min_cands_b4_sel: int = 0, buffer_size: int = 0):
+                 buffer_size: int = 0,
+                 min_cands_b4_sel: int = 0):
 
-        self.type = 'SamplerRandom'
         super().__init__(name, workspace,
-                         min_cands_b4_sel = min_cands_b4_sel,
-                         buffer_size = buffer_size)
+                         buffer_size = buffer_size,
+                         min_cands_b4_sel=min_cands_b4_sel,)
+        LOGGER.info(f'Initialized {self.__tag__()}')
 
     # --------------------------------------------------------------------------
     # confirm the selection of these points
@@ -31,10 +35,21 @@ class SamplerRandom(Sampler):
     # --------------------------------------------------------------------------
     # update the ranks of the candidates
     def _update_ranks(self) -> None:
-        for sample in self.candidates:
-            sample.rank = np.random.uniform()
+        n = len(self.candidates)
+
+        LOGGER.debug(f'Computing random ranks for ({n}) points')
+        ranks = np.random.rand(n).astype(np.float32)
+
+        # now apply these ranks to candidates
+        self._apply_ranks_to_candidates(ranks)
 
     # --------------------------------------------------------------------------
+    def checkpoint(self):
+        super()._checkpoint()
+
+    def restore(self):
+        super()._restore()
+
     def test(self) -> bool:
         return True
 
